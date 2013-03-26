@@ -8,7 +8,7 @@ var detective = require('detective');
 var through = require('through');
 var concatStream = require('concat-stream');
 
-module.exports = function (mains, opts) {
+module.exports = function (mains, opts, cache) {
     if (!Array.isArray(mains)) mains = [ mains ].filter(Boolean);
     mains = mains.map(function (file) {
         return path.resolve(file);
@@ -16,8 +16,7 @@ module.exports = function (mains, opts) {
     
     var visited = {};
     var pending = 0;
-    var cache = {};
-    
+
     var output = through();
     
     if (!opts) opts = {};
@@ -63,24 +62,65 @@ module.exports = function (mains, opts) {
                 return;
             }
             visited[file] = true;
-            
-            fs.readFile(file, 'utf8', function (err, src) {
+
+            function done (src, resolved, mtime) {
+                var rec = {
+                    id: file,
+                    source: src,
+                    mtime: mtime,
+                    deps: resolved
+                };
+                if (mains.indexOf(file) >= 0) {
+                    rec.entry = true;
+                }
+                output.queue(rec);
+                if (--pending === 0) output.queue(null);
+            }
+
+            fs.stat(file, function(err, stat){
                 if (err) return output.emit('error', err);
-                applyTransforms(file, trx, src);
+                var cachedSrcAndDeps = cache && cache[file];
+                var mtime = stat.mtime.getTime();
+                if(!cachedSrcAndDeps || cachedSrcAndDeps.mtime < mtime) {
+                    readSrc(file, trx, function(src){
+                        parseDeps(file, src,function(deps){
+                            if(cache){
+                            cache[file] = {
+                                src: src,
+                                deps: deps,
+                                mtime: mtime
+                            };
+                            }
+                            walkDeps(file, deps, function(resolved){
+                                done(src, resolved, mtime);
+                            });
+                        });
+                    });
+                } else {
+                    walkDeps(file, cachedSrcAndDeps.deps, function(resolved){
+                        done(cachedSrcAndDeps.src, resolved, mtime);
+                    });
+                }
             });
         });
     }
     
-    function applyTransforms (file, trx, src) {
+    function readSrc (file, trx, callback) {
+        fs.readFile(file, 'utf8', function (err, src) {
+            if (err) return output.emit('error', err);
+            applyTransforms(file, trx, src, callback);
+        });
+    }
+
+    function applyTransforms (file, trx, src, callback) {
         var isTopLevel = mains.some(function (main) {
             var m = path.relative(path.dirname(main), file);
             return m.split('/').indexOf('node_modules') < 0;
         });
         var transf = (isTopLevel ? transforms : []).concat(trx);
-        if (transf.length === 0) return done();
-        
+
         (function ap (trs) {
-            if (trs.length === 0) return done();
+            if (trs.length === 0) return callback(src);
             makeTransform(file, trs[0], function (s) {
                 s.on('error', output.emit.bind(output, 'error'));
                 s.pipe(concatStream(function (err, data) {
@@ -90,13 +130,9 @@ module.exports = function (mains, opts) {
                 s.end(src);
             });
         })(transf);
-        
-        function done () {
-            parseDeps(file, src);
-        }
     }
     
-    function parseDeps (file, src) {
+    function parseDeps (file, src, callback) {
         var deps;
         try {
             deps = detective(src);
@@ -104,6 +140,10 @@ module.exports = function (mains, opts) {
             var message = ex && ex.message ? ex.message : ex;
             return output.emit('error', new Error('Parsing file ' + file + ': ' + message));
         }
+        callback(deps);
+    }
+
+    function walkDeps (file, deps, callback) {
         var p = deps.length;
         var current = { id: file, filename: file, paths: [] };
         var resolved = {};
@@ -111,23 +151,10 @@ module.exports = function (mains, opts) {
         deps.forEach(function (id) {
             walk(id, current, function (r) {
                 resolved[id] = r;
-                if (--p === 0) done();
+                if (--p === 0) callback(resolved);
             });
         });
-        if (deps.length === 0) done();
-        
-        function done () {
-            var rec = {
-                id: file,
-                source: src,
-                deps: resolved
-            };
-            if (mains.indexOf(file) >= 0) {
-                rec.entry = true;
-            }
-            output.queue(rec);
-            if (--pending === 0) output.queue(null);
-        }
+        if (deps.length === 0) callback(resolved);
     }
     
     function makeTransform (file, tr, cb) {
